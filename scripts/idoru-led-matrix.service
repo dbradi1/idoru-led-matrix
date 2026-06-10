@@ -1,0 +1,16 @@
+[Unit]
+Description=Idoru LED Matrix Health Dashboard Cycler
+After=network-online.target bluetooth.target
+Wants=network-online.target bluetooth.target
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/home/drew/.idoru-display-env/bin/python3 /home/drew/github-repos/idoru-led-matrix/src/cycle.py --loop --pause 20 --display-time 3.5
+Restart=always
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/drew/.env
+
+[Install]
+WantedBy=default.target
