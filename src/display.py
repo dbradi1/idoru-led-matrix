@@ -5,6 +5,9 @@ Uses the idotmatrix library's Image module (DIY raw pixel mode).
 
 The display is 64×64 pixels. We render as 64×64 PNGs and send them
 directly — the library sends raw PNG data wrapped in BLE protocol chunks.
+
+Key: ConnectionManager is a singleton. We keep one connection open for
+the entire sequence to avoid BLE reconnect races.
 """
 
 import asyncio
@@ -12,7 +15,7 @@ import io
 import struct
 import sys
 import time
-from typing import List, Optional, Union
+from typing import List, Optional
 
 from PIL import Image as PilImage
 from idotmatrix import ConnectionManager
@@ -23,16 +26,23 @@ DISPLAY_HEIGHT = 64
 
 
 class DisplayClient:
-    """Manages BLE connection to the iDotMatrix display for image uploads."""
+    """Manages BLE connection to the iDotMatrix display for image uploads.
+    
+    Keeps the connection open across multiple image pushes to avoid
+    BLE reconnect races that cause 'device not found' errors.
+    """
     
     def __init__(self, address: str = DEVICE_ADDR):
         self.address = address
         self.cm: Optional[ConnectionManager] = None
+        self._connected = False
     
     async def connect(self):
-        """Establish BLE connection."""
+        """Establish BLE connection and keep it open."""
         self.cm = ConnectionManager()
-        await self.cm.connectByAddress(self.address)
+        self.cm.address = self.address
+        await self.cm.connect()
+        self._connected = True
         return self
     
     async def disconnect(self):
@@ -43,6 +53,7 @@ class DisplayClient:
             except Exception:
                 pass
             self.cm = None
+            self._connected = False
     
     async def enter_diy_mode(self, mode: int = 1) -> bool:
         """Enter DIY draw mode (raw pixel mode)."""
@@ -56,24 +67,18 @@ class DisplayClient:
             return False
     
     async def upload_image(self, image_path: str) -> bool:
-        """Upload a PNG image to the display.
-        
-        The image must be 64×64 pixels. Uses raw BLE protocol directly.
-        """
+        """Upload a PNG image to the display over the existing connection."""
         try:
-            # Load and verify the PNG
             img = PilImage.open(image_path)
             if img.size != (DISPLAY_WIDTH, DISPLAY_HEIGHT):
                 print(f"[display] WARNING: Image {image_path} is {img.size}, expected {DISPLAY_WIDTH}×{DISPLAY_HEIGHT}",
                       file=sys.stderr)
             
-            # Convert to PNG bytes
             png_buffer = io.BytesIO()
             img.save(png_buffer, format="PNG")
             png_buffer.seek(0)
             png_data = png_buffer.getvalue()
             
-            # Build BLE payloads (mirrors idotmatrix _createPayloads logic)
             chunk_size = 4096
             png_chunks = [png_data[i:i+chunk_size] for i in range(0, len(png_data), chunk_size)]
             idk = len(png_data) + len(png_chunks)
@@ -95,46 +100,42 @@ class DisplayClient:
             print(f"[display] Upload failed for {image_path}: {e}", file=sys.stderr)
             return False
     
-    async def push(self, image_path: str, display_time: float = 3.0) -> bool:
-        """Push an image to the display with retry logic."""
+    async def push_sequence(self, image_paths: List[str], display_time: float = 3.0,
+                            pause_between: float = 0.5) -> bool:
+        """Push a sequence of images keeping one BLE connection open."""
+        success_count = 0
+        
         for attempt in range(3):
             try:
                 await self.connect()
                 await self.enter_diy_mode()
-                
-                success = await self.upload_image(image_path)
-                if success:
-                    await asyncio.sleep(display_time)
-                
-                await self.disconnect()
-                return success
+                break
             except Exception as e:
-                print(f"[display] Attempt {attempt+1}/3 failed: {e}", file=sys.stderr)
+                print(f"[display] Connection attempt {attempt+1}/3 failed: {e}", file=sys.stderr)
                 if attempt < 2:
                     await asyncio.sleep(3 * (attempt + 1))
                 else:
-                    print(f"[display] All retries exhausted for {image_path}", file=sys.stderr)
+                    print("[display] Could not connect to display", file=sys.stderr)
                     return False
-
-
-async def push_sequence(image_paths: List[str], display_time: float = 3.0, 
-                        pause_between: float = 0.5) -> bool:
-    """Push a sequence of images to the display."""
-    client = DisplayClient()
-    success_count = 0
-    
-    for path in image_paths:
-        print(f"[display] Pushing {path}...", file=sys.stderr)
-        ok = await client.push(path, display_time)
-        if ok:
-            success_count += 1
-            await asyncio.sleep(pause_between)
-        else:
-            await asyncio.sleep(1)
-    
-    print(f"[display] Sequence complete: {success_count}/{len(image_paths)} pushed successfully",
-          file=sys.stderr)
-    return success_count == len(image_paths)
+        
+        for path in image_paths:
+            print(f"[display] Pushing {path}...", file=sys.stderr)
+            try:
+                ok = await self.upload_image(path)
+                if ok:
+                    success_count += 1
+                    await asyncio.sleep(display_time + pause_between)
+                else:
+                    await asyncio.sleep(1)
+            except Exception as e:
+                print(f"[display] Error pushing {path}: {e}", file=sys.stderr)
+                await asyncio.sleep(1)
+        
+        await self.disconnect()
+        
+        print(f"[display] Sequence complete: {success_count}/{len(image_paths)} pushed successfully",
+              file=sys.stderr)
+        return success_count == len(image_paths)
 
 
 async def main():
@@ -147,11 +148,8 @@ async def main():
     if images[0] == "--sequence":
         images = images[1:]
     
-    if len(images) == 1:
-        client = DisplayClient()
-        await client.push(images[0])
-    else:
-        await push_sequence(images)
+    client = DisplayClient()
+    await client.push_sequence(images)
 
 
 if __name__ == "__main__":

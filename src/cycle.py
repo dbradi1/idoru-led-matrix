@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fetch import fetch_all
 from render import render_all, RENDERERS
-from display import push_sequence
+from display import DisplayClient
 
 OUTPUT_DIR = "/home/drew/.cache/idoru-led-matrix"
 
@@ -42,7 +42,8 @@ async def run_cycle(push_to_display: bool = True, display_time: float = 3.0):
     # 3. Push to display
     if push_to_display:
         print("[cycle] Pushing to LED matrix...", file=sys.stderr)
-        success = await push_sequence(paths, display_time=display_time)
+        client = DisplayClient()
+        success = await client.push_sequence(paths, display_time=display_time)
         if not success:
             print("[cycle] ⚠️ Some images failed to push", file=sys.stderr)
     else:
