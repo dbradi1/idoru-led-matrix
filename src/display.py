@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
-Push pixel-art dashboards to the iDotMatrix LED display via BLE.
+Push pixel-art dashboards to the iDotMatrix 64×64 LED display via BLE.
 Uses the idotmatrix library's Image module (DIY raw pixel mode).
 
-Key detail: The display is 16×32 pixels, but the idotmatrix library's
-uploadProcessed() expects square images (16×16 or 32×32). For 16×32,
-we need to use uploadUnprocessed and ensure the PNG is exactly the
-right dimensions.
-
-We render as 16×32 PNGs and send them directly — the library sends raw
-PNG data wrapped in the correct BLE protocol chunks.
+The display is 64×64 pixels. We render as 64×64 PNGs and send them
+directly — the library sends raw PNG data wrapped in BLE protocol chunks.
 """
 
 import asyncio
@@ -23,8 +18,8 @@ from PIL import Image as PilImage
 from idotmatrix import ConnectionManager
 
 DEVICE_ADDR = "26:C8:1C:3B:99:F5"
-DISPLAY_WIDTH = 16
-DISPLAY_HEIGHT = 32
+DISPLAY_WIDTH = 64
+DISPLAY_HEIGHT = 64
 
 
 class DisplayClient:
@@ -63,8 +58,7 @@ class DisplayClient:
     async def upload_image(self, image_path: str) -> bool:
         """Upload a PNG image to the display.
         
-        The image must be 16×32 pixels. We use the raw BLE protocol directly
-        since uploadProcessed() forces square dimensions.
+        The image must be 64×64 pixels. Uses raw BLE protocol directly.
         """
         try:
             # Load and verify the PNG
@@ -136,7 +130,6 @@ async def push_sequence(image_paths: List[str], display_time: float = 3.0,
             success_count += 1
             await asyncio.sleep(pause_between)
         else:
-            # Even on failure, pause before next attempt
             await asyncio.sleep(1)
     
     print(f"[display] Sequence complete: {success_count}/{len(image_paths)} pushed successfully",

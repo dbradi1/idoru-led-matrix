@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Pixel-art chart renderer for the iDotMatrix 16×32 LED display.
+Pixel-art chart renderer for the iDotMatrix 64×64 LED display.
 Generates tiny PNG images optimized for the display's resolution.
 
-Dashboards (16×32 portrait — 16 wide, 32 tall):
-  1. Avg Power (W)        — horizontal bar with watt value
-  2. Calories In vs Out   — dual bars with kcal labels
-  3. Net Calorie Balance  — surplus/deficit bar from center
-  4. Daily Protein        — progress bar toward 130g goal
-  5. Sleep Duration       — stacked bar (deep/rem/core/awake)
+Dashboards (64×64 square):
+  1. Avg Power (W)        — large numeric + bar + trend indicator
+  2. Calories In vs Out   — dual bars with labels + net delta
+  3. Net Calorie Balance  — center-zero vertical bar + status
+  4. Daily Protein        — progress bar to 130g goal + percentage
+  5. Sleep Duration       — stacked bar (deep/rem/core/awake) + quality
 
-At 16×32, readable text is extremely limited. Each dashboard uses:
-  - 3px top header label
-  - Main visual bar/chart (fills middle ~20px)
-  - 4px bottom footer with value
+At 64×64 we have 4,096 pixels — enough for:
+  - 7px header labels with icons
+  - Large 10-12px numeric values
+  - Rich gradient bars with goal markers
+  - Multi-line footer with status + units
+  - Decorative borders and dividers
 """
 
 import math
@@ -25,13 +27,13 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 # ──────────────────────────────────────────────────
-# Canvas: 16×32 portrait
+# Canvas: 64×64 square
 # ──────────────────────────────────────────────────
 
-WIDTH = 16
-HEIGHT = 32
+WIDTH = 64
+HEIGHT = 64
 
-# Color palette
+# Color palette — cyberpunk Idoru theme
 BG       = (4,  2,  12)     # Near-black purple
 PURPLE   = (140, 30, 230)   # Idoru purple
 CYAN     = (0,  230, 230)   # Cyan
@@ -42,8 +44,10 @@ RED      = (240, 30, 30)    # Red
 WHITE    = (220, 210, 245)  # Soft white
 BLUE     = (50, 130, 255)   # Blue
 DIM      = (50, 35, 80)     # Dim accent
+DARKER   = (15, 10, 30)     # Darker fill
+PINK     = (255, 80, 180)   # Accent pink
 
-# Font setup — use the smallest readable size
+# Font setup
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 
 
@@ -54,45 +58,96 @@ def get_font(size: int) -> ImageFont.FreeTypeFont:
         return ImageFont.load_default()
 
 
-FONT_HDR = None  # 5px for headers
-FONT_VAL = None  # 6px for values
+FONT_HDR = None   # 7px for headers
+FONT_VAL = None   # 10px for big values
+FONT_SM  = None   # 6px for small labels
+FONT_XS  = None   # 5px for tiny annotations
 
 
 def _init_fonts():
-    global FONT_HDR, FONT_VAL
+    global FONT_HDR, FONT_VAL, FONT_SM, FONT_XS
     if FONT_HDR is None:
-        FONT_HDR = get_font(5)
-        FONT_VAL = get_font(6)
+        FONT_HDR = get_font(7)
+        FONT_VAL = get_font(10)
+        FONT_SM  = get_font(6)
+        FONT_XS  = get_font(5)
 
 
 def new_canvas() -> Image.Image:
-    """Create a fresh 16×32 canvas with dark background."""
+    """Create a fresh 64×64 canvas with dark background."""
     return Image.new("RGB", (WIDTH, HEIGHT), BG)
 
 
-def draw_hline(draw, y, color=DIM):
-    """Horizontal rule at y with padding."""
-    for x in range(1, WIDTH - 1):
+def draw_hline(draw, y, color=DIM, x0=1, x1=None):
+    """Horizontal rule."""
+    if x1 is None:
+        x1 = WIDTH - 1
+    for x in range(x0, x1):
         draw.point((x, y), color)
 
 
-def draw_text(draw, text: str, y: int, color, font_size: int = 5, center: bool = True):
-    """Draw tiny centered text using Pillow."""
+def draw_vline(draw, x, color=DIM, y0=1, y1=None):
+    """Vertical rule."""
+    if y1 is None:
+        y1 = HEIGHT - 1
+    for y in range(y0, y1):
+        draw.point((x, y), color)
+
+
+def draw_rect(draw, x, y, w, h, color, fill=False):
+    """Draw a rectangle outline or filled."""
+    if fill:
+        for dy in range(h):
+            for dx in range(w):
+                px, py = x + dx, y + dy
+                if 0 <= px < WIDTH and 0 <= py < HEIGHT:
+                    draw.point((px, py), color)
+    else:
+        draw_hline(draw, y, color, x, x + w)
+        draw_hline(draw, y + h - 1, color, x, x + w)
+        draw_vline(draw, x, color, y, y + h)
+        draw_vline(draw, x + w - 1, color, y, y + h)
+
+
+def draw_text(draw, text: str, y: int, color, font_size: int = 7, 
+              center: bool = True, x_offset: int = 0):
+    """Draw text with dark outline for contrast."""
     _init_fonts()
-    font = FONT_HDR if font_size <= 5 else FONT_VAL
+    if font_size <= 5:
+        font = FONT_XS
+    elif font_size <= 6:
+        font = FONT_SM
+    elif font_size <= 7:
+        font = FONT_HDR
+    else:
+        font = FONT_VAL
     
-    # Use ImageDraw text with tiny font
-    # Get text width via textbbox (Pillow 8+)
     bbox = draw.textbbox((0, 0), text, font=font)
     tw = bbox[2] - bbox[0]
     
-    x = (WIDTH - tw) // 2 if center else 1
-    x = max(0, min(x, WIDTH - tw))
+    if center:
+        x = (WIDTH - tw) // 2 + x_offset
+    else:
+        x = 2 + x_offset
+    x = max(1, min(x, WIDTH - tw - 1))
     
-    # Draw with a dark outline for contrast
+    # Dark outline
+    for ox, oy in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1)]:
+        draw.text((x + ox, y + oy), text, fill=BG, font=font)
+    draw.text((x, y), text, fill=color, font=font)
+
+
+def draw_text_right(draw, text: str, y: int, color, font_size: int = 6):
+    """Right-aligned text."""
+    _init_fonts()
+    font = FONT_SM if font_size <= 6 else FONT_HDR
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw = bbox[2] - bbox[0]
+    x = WIDTH - tw - 2
+    x = max(1, x)
     for ox, oy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-        draw.text((x + ox, y + oy + 1), text, fill=BG, font=font)
-    draw.text((x, y + 1), text, fill=color, font=font)
+        draw.text((x + ox, y + oy), text, fill=BG, font=font)
+    draw.text((x, y), text, fill=color, font=font)
 
 
 # ──────────────────────────────────────────────────
@@ -100,38 +155,42 @@ def draw_text(draw, text: str, y: int, color, font_size: int = 5, center: bool =
 # ──────────────────────────────────────────────────
 
 def draw_hbar(draw, x: int, y: int, w: int, h: int, ratio: float, 
-              color: Tuple[int, int, int], bg_color=None):
-    """Draw a horizontal progress bar.
-    
-    ratio: 0.0 = empty, 1.0 = full
-    """
+              color: Tuple[int, int, int], bg_color=None, 
+              gradient: bool = True):
+    """Draw a horizontal progress bar with optional gradient."""
     ratio = max(0.0, min(1.0, ratio))
     filled = int(w * ratio)
     
     if bg_color is None:
-        bg_color = DIM
+        bg_color = DARKER
     
     for dy in range(h):
         for dx in range(w):
             px, py = x + dx, y + dy
             if 0 <= px < WIDTH and 0 <= py < HEIGHT:
                 if dx < filled:
-                    # Gradient: brighter near top of bar
-                    brightness = 0.6 + 0.4 * (1.0 - dy / max(h, 1))
-                    c = tuple(min(255, int(ch * brightness)) for ch in color)
+                    if gradient:
+                        # Brighter at top, dimmer at bottom
+                        brightness = 0.5 + 0.5 * (1.0 - dy / max(h, 1))
+                        # Also brighter at left edge
+                        edge_bright = 0.85 + 0.15 * (1.0 - dx / max(filled, 1))
+                        brightness = brightness * 0.7 + edge_bright * 0.3
+                        c = tuple(min(255, int(ch * brightness)) for ch in color)
+                    else:
+                        c = color
                     draw.point((px, py), c)
                 else:
                     draw.point((px, py), bg_color)
 
 
 def draw_vbar(draw, x: int, y: int, w: int, h: int, ratio: float,
-              color, upward: bool = True, bg_color=None):
-    """Draw a vertical progress bar (fills from bottom or top)."""
+              color, upward: bool = True, bg_color=None, gradient: bool = True):
+    """Draw a vertical progress bar."""
     ratio = max(0.0, min(1.0, ratio))
     filled = int(h * ratio)
     
     if bg_color is None:
-        bg_color = DIM
+        bg_color = DARKER
     
     for dy in range(h):
         px_row = y + (h - 1 - dy) if upward else y + dy
@@ -139,11 +198,25 @@ def draw_vbar(draw, x: int, y: int, w: int, h: int, ratio: float,
             px, py = x + dx, px_row
             if 0 <= px < WIDTH and 0 <= py < HEIGHT:
                 if dy < filled:
-                    brightness = 0.6 + 0.4 * (1.0 - dx / max(w, 1))
-                    c = tuple(min(255, int(ch * brightness)) for ch in color)
+                    if gradient:
+                        brightness = 0.5 + 0.5 * (1.0 - dx / max(w, 1))
+                        c = tuple(min(255, int(ch * brightness)) for ch in color)
+                    else:
+                        c = color
                     draw.point((px, py), c)
                 else:
                     draw.point((px, py), bg_color)
+
+
+def draw_dual_hbar(draw, x, y, w, h, ratio1, color1, ratio2, color2, 
+                   gap: int = 1, bg_color=None):
+    """Two bars side by side in the same row (for comparison)."""
+    if bg_color is None:
+        bg_color = DARKER
+    
+    half_w = (w - gap) // 2
+    draw_hbar(draw, x, y, half_w, h, ratio1, color1, bg_color)
+    draw_hbar(draw, x + half_w + gap, y, half_w, h, ratio2, color2, bg_color)
 
 
 # ──────────────────────────────────────────────────
@@ -151,155 +224,186 @@ def draw_vbar(draw, x: int, y: int, w: int, h: int, ratio: float,
 # ──────────────────────────────────────────────────
 
 def render_avg_power(data: Dict[str, Any]) -> Image.Image:
-    """Dashboard 1: Avg Power (watts) — bar + numeric value."""
+    """Dashboard 1: Avg Power (watts) — large value + bar + status."""
     img = new_canvas()
     draw = ImageDraw.Draw(img)
     
     watts = data.get("avg_power_watts", 0)
     
-    # Header
-    draw_hline(draw, 0, PURPLE)
-    draw_text(draw, "WATT", 0, CYAN, 5)
-    draw_hline(draw, 4, DIM)
+    # ── Header bar ──
+    draw_rect(draw, 0, 0, WIDTH, 8, PURPLE, fill=True)
+    draw_text(draw, "⚡ POWER", 1, WHITE, 7)
     
-    # Big value
+    # ── Big value ──
     val_str = f"{watts:.0f}"
-    draw_text(draw, val_str, 6, WHITE, 6)
+    draw_text(draw, val_str, 12, WHITE, 10)
+    draw_text(draw, "WATTS", 22, CYAN, 6)
     
-    # Bar (8px tall)
+    # ── Bar (14px tall, full width) ──
     max_w = 300
     ratio = min(watts / max_w, 1.0) if max_w > 0 else 0
     
-    if ratio < 0.33:
+    if ratio < 0.25:
         bar_color = CYAN
-    elif ratio < 0.66:
+    elif ratio < 0.5:
+        bar_color = GREEN
+    elif ratio < 0.75:
         bar_color = YELLOW
     else:
-        bar_color = ORANGE
+        bar_color = RED
     
-    draw_hbar(draw, 1, 14, WIDTH - 2, 6, ratio, bar_color)
+    bar_y = 30
+    bar_h = 14
+    bar_w = WIDTH - 4
+    draw_hbar(draw, 2, bar_y, bar_w, bar_h, ratio, bar_color)
     
-    # Unit indicator
-    draw_text(draw, "W", 21, PURPLE, 5)
+    # Tick marks on bar
+    for tick_pct in [0.25, 0.5, 0.75]:
+        tx = 2 + int(bar_w * tick_pct)
+        for dy in range(bar_h):
+            if dy % 3 == 0:
+                draw.point((tx, bar_y + dy), BG)
     
-    # Footer with activity level
+    # ── Footer ──
+    draw_hline(draw, 48, DIM)
+    
     if watts < 50:
-        label = "LOW"
-        lc = DIM
-    elif watts < 150:
-        label = "MOD"
-        lc = GREEN
+        label, lc = "REST", DIM
+    elif watts < 100:
+        label, lc = "EASY", CYAN
+    elif watts < 175:
+        label, lc = "MOD", GREEN
     elif watts < 250:
-        label = "HI"
-        lc = YELLOW
+        label, lc = "HARD", YELLOW
     else:
-        label = "MAX"
-        lc = RED
+        label, lc = "MAX", RED
     
-    draw_hline(draw, 27, DIM)
-    draw_text(draw, label, 27, lc, 5)
+    draw_text(draw, label, 50, lc, 7)
+    draw_text(draw, f"{ratio*100:.0f}%", 57, DIM, 5)
     
     return img
 
 
 def render_calories_in_out(data: Dict[str, Any]) -> Image.Image:
-    """Dashboard 2: Calories In vs Out — dual horizontal bars."""
+    """Dashboard 2: Calories In vs Out — dual bars + net delta."""
     img = new_canvas()
     draw = ImageDraw.Draw(img)
     
     cals_in = data.get("calories_in", 0)
     cals_out = data.get("calories_out", 0)
     
-    # Header
-    draw_hline(draw, 0, PURPLE)
-    draw_text(draw, "KCAL", 0, CYAN, 5)
-    draw_hline(draw, 4, DIM)
+    # ── Header ──
+    draw_rect(draw, 0, 0, WIDTH, 8, PURPLE, fill=True)
+    draw_text(draw, "🔥 KCAL", 1, WHITE, 7)
     
-    # Scale: round up to nearest 500
+    # ── Scale ──
     max_cal = max(cals_in, cals_out, 100)
     max_cal = math.ceil(max_cal / 500) * 500
     
-    # IN bar (green)
+    # ── IN bar (green, top) ──
     in_ratio = cals_in / max_cal if max_cal > 0 else 0
-    draw_hbar(draw, 1, 6, WIDTH - 2, 5, in_ratio, GREEN)
+    bar_w = WIDTH - 4
+    bar_h = 10
     
-    # IN label
-    draw_text(draw, f"IN{cals_in:.0f}", 6, GREEN, 5, center=False)
+    draw_text(draw, "IN", 10, GREEN, 6, center=False)
+    draw_text_right(draw, f"{cals_in:.0f}", 10, GREEN, 6)
+    draw_hbar(draw, 2, 18, bar_w, bar_h, in_ratio, GREEN)
     
-    # OUT bar (orange) with gap
+    # ── OUT bar (orange, bottom) ──
     out_ratio = cals_out / max_cal if max_cal > 0 else 0
-    draw_hbar(draw, 1, 13, WIDTH - 2, 5, out_ratio, ORANGE)
     
-    # OUT label
-    draw_text(draw, f"OUT{cals_out:.0f}", 13, ORANGE, 5, center=False)
+    draw_text(draw, "OUT", 30, ORANGE, 6, center=False)
+    draw_text_right(draw, f"{cals_out:.0f}", 30, ORANGE, 6)
+    draw_hbar(draw, 2, 38, bar_w, bar_h, out_ratio, ORANGE)
     
-    # Comparison footer
+    # ── Net delta ──
     diff = cals_in - cals_out
-    if diff > 0:
-        footer = f"+{diff:.0f}"
-        fc = GREEN
-    else:
-        footer = f"{diff:.0f}"
-        fc = RED if diff < -500 else YELLOW
+    draw_hline(draw, 50, DIM)
     
-    draw_hline(draw, 27, DIM)
-    draw_text(draw, footer, 27, fc, 5)
+    if diff > 0:
+        delta_str = f"+{diff:.0f} kcal"
+        dc = GREEN
+        status = "SURPLUS"
+    elif diff < 0:
+        delta_str = f"{diff:.0f} kcal"
+        dc = RED if diff < -500 else YELLOW
+        status = "DEFICIT"
+    else:
+        delta_str = "0 kcal"
+        dc = WHITE
+        status = "BALANCED"
+    
+    draw_text(draw, delta_str, 52, dc, 7)
+    draw_text(draw, status, 59, DIM, 5)
     
     return img
 
 
 def render_net_calories(data: Dict[str, Any]) -> Image.Image:
-    """Dashboard 3: Net Calorie Balance — center-zero bar."""
+    """Dashboard 3: Net Calorie Balance — center-zero vertical bar."""
     img = new_canvas()
     draw = ImageDraw.Draw(img)
     
     net = data.get("net_calories", 0)
     
-    # Header
-    draw_hline(draw, 0, PURPLE)
-    draw_text(draw, "NET", 0, CYAN, 5)
-    draw_hline(draw, 4, DIM)
+    # ── Header ──
+    draw_rect(draw, 0, 0, WIDTH, 8, PURPLE, fill=True)
+    draw_text(draw, "⚖ NET", 1, WHITE, 7)
     
-    # Center line at pixel row 17
-    center_y = 17
-    for x in range(2, WIDTH - 2):
-        draw.point((x, center_y), DIM)
+    # ── Center zero line ──
+    center_y = 32
+    draw_hline(draw, center_y, DIM, 4, WIDTH - 4)
     
-    # Value
+    # ── Value ──
     sign = "+" if net >= 0 else "-"
     val_str = f"{sign}{abs(net):.0f}"
-    draw_text(draw, val_str, 5, WHITE, 6)
+    draw_text(draw, val_str, 10, WHITE, 10)
+    draw_text(draw, "kcal", 20, CYAN, 6)
     
-    # Bar from center (vertical bar, 12px max height)
-    max_net = 1500
-    bar_h_max = 12
+    # ── Vertical bar from center ──
+    max_net = 2000
+    bar_h_max = 20  # pixels above/below center
     ratio = min(abs(net) / max_net, 1.0) if max_net > 0 else 0
-    bar_w = 8
+    bar_w = 20
+    
+    bar_x = (WIDTH - bar_w) // 2
     
     if net > 0:
-        # Surplus: green/orange bar going UP from center
-        color = GREEN if net < 500 else YELLOW if net < 1000 else ORANGE
-        draw_vbar(draw, (WIDTH - bar_w) // 2, center_y - int(bar_h_max * ratio),
-                  bar_w, int(bar_h_max * ratio), 1.0, color, upward=True)
+        # Surplus: bar going UP from center
+        if net < 500:
+            color = GREEN
+        elif net < 1000:
+            color = YELLOW
+        else:
+            color = RED
+        bar_h = int(bar_h_max * ratio)
+        if bar_h > 0:
+            draw_vbar(draw, bar_x, center_y - bar_h, bar_w, bar_h, 1.0, color, upward=True)
     elif net < 0:
-        # Deficit: cyan bar going DOWN from center
-        color = CYAN if abs(net) < 500 else BLUE
-        draw_vbar(draw, (WIDTH - bar_w) // 2, center_y,
-                  bar_w, int(bar_h_max * ratio), 1.0, color, upward=False)
+        # Deficit: bar going DOWN from center
+        if abs(net) < 500:
+            color = CYAN
+        else:
+            color = BLUE
+        bar_h = int(bar_h_max * ratio)
+        if bar_h > 0:
+            draw_vbar(draw, bar_x, center_y, bar_w, bar_h, 1.0, color, upward=False)
     
-    # Footer status
-    if net > 0:
-        status = "SUR+" if net > 500 else "ok+"
-        sc = GREEN if net <= 500 else YELLOW
+    # ── Footer ──
+    draw_hline(draw, 55, DIM)
+    
+    if net > 500:
+        status, sc = "SURPLUS ↑", YELLOW
+    elif net > 0:
+        status, sc = "slight +", GREEN
+    elif net < -500:
+        status, sc = "DEFICIT ↓", BLUE
     elif net < 0:
-        status = "DEF" if abs(net) > 500 else "ok-"
-        sc = CYAN if abs(net) <= 500 else BLUE
+        status, sc = "slight -", CYAN
     else:
-        status = "BAL"
-        sc = WHITE
+        status, sc = "BALANCED", WHITE
     
-    draw_hline(draw, 27, DIM)
-    draw_text(draw, status, 27, sc, 5)
+    draw_text(draw, status, 57, sc, 7)
     
     return img
 
@@ -312,44 +416,63 @@ def render_protein(data: Dict[str, Any]) -> Image.Image:
     protein = data.get("protein_grams", 0)
     goal = 130
     
-    # Header
-    draw_hline(draw, 0, PURPLE)
-    draw_text(draw, "PROT", 0, CYAN, 5)
-    draw_hline(draw, 4, DIM)
+    # ── Header ──
+    draw_rect(draw, 0, 0, WIDTH, 8, PURPLE, fill=True)
+    draw_text(draw, "🥩 PROTEIN", 1, WHITE, 7)
     
-    # Value
-    draw_text(draw, f"{protein:.0f}g", 5, WHITE, 6)
+    # ── Big value ──
+    draw_text(draw, f"{protein:.0f}", 12, WHITE, 10)
+    draw_text(draw, "grams", 22, CYAN, 6)
     
-    # Progress bar (10px tall)
+    # ── Progress bar (16px tall) ──
     ratio = min(protein / goal, 1.0) if goal > 0 else 0
     
     if ratio < 0.33:
         bar_color = RED
-    elif ratio < 0.66:
+    elif ratio < 0.5:
         bar_color = ORANGE
-    elif ratio < 0.85:
+    elif ratio < 0.75:
         bar_color = YELLOW
     else:
         bar_color = GREEN
     
-    bar_y = 12
-    bar_h = 10
-    draw_hbar(draw, 1, bar_y, WIDTH - 2, bar_h, ratio, bar_color)
+    bar_y = 30
+    bar_h = 16
+    bar_w = WIDTH - 4
+    draw_hbar(draw, 2, bar_y, bar_w, bar_h, ratio, bar_color)
     
-    # Goal marker at right edge
+    # Goal marker line
+    goal_x = 2 + bar_w - 1
     for dy in range(bar_h):
-        draw.point((WIDTH - 2, bar_y + dy), WHITE)
+        if dy % 2 == 0:
+            draw.point((goal_x, bar_y + dy), WHITE)
     
-    # Percentage
+    # Goal label
+    draw_text_right(draw, f"/{goal}g", bar_y + 2, WHITE, 6)
+    
+    # ── Percentage + status ──
     pct = int(ratio * 100)
-    draw_hline(draw, 27, DIM)
-    draw_text(draw, f"{pct}%", 27, bar_color, 5)
+    draw_hline(draw, 50, DIM)
+    
+    if ratio >= 1.0:
+        status, sc = "HIT GOAL!", GREEN
+    elif ratio >= 0.75:
+        status, sc = "CLOSE", YELLOW
+    elif ratio >= 0.5:
+        status, sc = "HALFWAY", ORANGE
+    elif ratio > 0:
+        status, sc = "LOW", RED
+    else:
+        status, sc = "NONE", DIM
+    
+    draw_text(draw, f"{pct}%", 52, bar_color, 7)
+    draw_text(draw, status, 58, sc, 5)
     
     return img
 
 
 def render_sleep(data: Dict[str, Any]) -> Image.Image:
-    """Dashboard 5: Sleep Duration — stacked segmented bar."""
+    """Dashboard 5: Sleep Duration — stacked bar + quality."""
     img = new_canvas()
     draw = ImageDraw.Draw(img)
     
@@ -360,59 +483,72 @@ def render_sleep(data: Dict[str, Any]) -> Image.Image:
     core = sleep.get("core", 0)
     awake = sleep.get("awake", 0)
     
-    # Header
-    draw_hline(draw, 0, PURPLE)
-    draw_text(draw, "SLEP", 0, CYAN, 5)
-    draw_hline(draw, 4, DIM)
+    # ── Header ──
+    draw_rect(draw, 0, 0, WIDTH, 8, PURPLE, fill=True)
+    draw_text(draw, "😴 SLEEP", 1, WHITE, 7)
     
-    # Value
+    # ── Big value ──
     h = int(total)
     m = int((total - h) * 60)
-    draw_text(draw, f"{h}h{m:02d}", 5, WHITE, 6)
+    draw_text(draw, f"{h}h {m:02d}m", 12, WHITE, 10)
     
-    # Stacked sleep bar (10px tall)
+    # ── Stacked sleep bar (18px tall) ──
     max_sleep = 10.0
-    bar_y = 12
-    bar_h = 10
+    bar_y = 24
+    bar_h = 18
+    bar_w = WIDTH - 4
     
     segments = [
-        (deep, PURPLE),
-        (rem, CYAN),
-        (core, BLUE),
-        (awake, (60, 15, 25)),  # Dark red for awake
+        (deep,  PURPLE, "DEEP"),
+        (rem,   CYAN,   "REM"),
+        (core,  BLUE,   "CORE"),
+        (awake, (60, 15, 25), "AWK"),
     ]
     
-    x_cursor = 1
-    for seg_hours, seg_color in segments:
+    x_cursor = 2
+    for seg_hours, seg_color, seg_label in segments:
         seg_ratio = min(seg_hours / max_sleep, 1.0) if max_sleep > 0 else 0
-        seg_w = max(0, int((WIDTH - 2) * seg_ratio))
-        if seg_w > 0 and x_cursor < WIDTH - 1:
-            actual_w = min(seg_w, WIDTH - 1 - x_cursor)
-            draw_hbar(draw, x_cursor, bar_y, actual_w, bar_h, 1.0, seg_color, seg_color)
+        seg_w = max(0, int(bar_w * seg_ratio))
+        if seg_w > 0 and x_cursor < WIDTH - 2:
+            actual_w = min(seg_w, WIDTH - 2 - x_cursor)
+            draw_hbar(draw, x_cursor, bar_y, actual_w, bar_h, 1.0, seg_color, seg_color, gradient=False)
             x_cursor += actual_w
     
-    # Fill remaining with BG if total < max
-    if x_cursor < WIDTH - 1:
-        for dy in range(bar_h):
-            for dx in range(x_cursor, WIDTH - 1):
-                draw.point((dx, bar_y + dy), (15, 10, 30))
+    # Fill remaining
+    if x_cursor < WIDTH - 2:
+        draw_rect(draw, x_cursor, bar_y, WIDTH - 2 - x_cursor, bar_h, DARKER, fill=True)
     
-    # Quality footer
-    if total >= 7.5:
-        q = "OPT"
-        qc = GREEN
+    # ── Legend ──
+    legend_y = 44
+    legend_items = [
+        (2, PURPLE, "D"),
+        (18, CYAN, "R"),
+        (34, BLUE, "C"),
+        (50, (60, 15, 25), "A"),
+    ]
+    for lx, lc, ll in legend_items:
+        draw_text(draw, ll, legend_y, lc, 6, center=True, x_offset=lx - WIDTH//2)
+    
+    # ── Quality footer ──
+    draw_hline(draw, 52, DIM)
+    
+    if total >= 8:
+        q, qc = "OPTIMAL", GREEN
+    elif total >= 7:
+        q, qc = "GOOD", CYAN
     elif total >= 6:
-        q = " OK"
-        qc = YELLOW
+        q, qc = "OK", YELLOW
     elif total > 0:
-        q = "LOW"
-        qc = RED
+        q, qc = "LOW", RED
     else:
-        q = "N/A"
-        qc = DIM
+        q, qc = "NO DATA", DIM
     
-    draw_hline(draw, 27, DIM)
-    draw_text(draw, q, 27, qc, 5)
+    draw_text(draw, q, 55, qc, 7)
+    
+    # Deep sleep % if we have data
+    if total > 0:
+        deep_pct = int(deep / total * 100)
+        draw_text(draw, f"deep {deep_pct}%", 61, PURPLE, 5)
     
     return img
 
@@ -460,7 +596,6 @@ if __name__ == "__main__":
         if sys.argv[1] == "--output-dir" and len(sys.argv) > 2:
             output_dir = sys.argv[2]
         elif sys.argv[1] in RENDERERS:
-            # Render single dashboard
             test_data = {
                 "avg_power_watts": 175,
                 "calories_in": 2100,
