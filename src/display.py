@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
 Push pixel-art dashboards to the iDotMatrix 64×64 LED display via BLE.
-Uses the idotmatrix library's Image module (DIY raw pixel mode).
+Uses graffiti mode (setPixel) — the only protocol path that works on this device.
 
-The display is 64×64 pixels. We render as 64×64 PNGs and send them
-directly — the library sends raw PNG data wrapped in BLE protocol chunks.
+The PNG upload (DIY mode) commands are accepted by the BLE stack but the
+display ignores them. Fullscreen color and graffiti pixel commands work,
+so we render dashboards pixel-by-pixel.
 
-Key: ConnectionManager is a singleton. We keep one connection open for
-the entire sequence to avoid BLE reconnect races.
+At 64×64 = 4,096 pixels per dashboard, we batch pixels into groups of ~200
+per BLE write to keep it fast (~20 writes per dashboard).
 """
 
 import asyncio
-import io
-import struct
 import sys
 import time
 from typing import List, Optional
@@ -23,81 +22,71 @@ from idotmatrix import ConnectionManager
 DEVICE_ADDR = "26:C8:1C:3B:99:F5"
 DISPLAY_WIDTH = 64
 DISPLAY_HEIGHT = 64
+PIXELS_PER_WRITE = 200  # Batch size for graffiti commands
 
 
 class DisplayClient:
-    """Manages BLE connection to the iDotMatrix display for image uploads.
-    
-    Keeps the connection open across multiple image pushes to avoid
-    BLE reconnect races that cause 'device not found' errors.
-    """
+    """Pushes dashboards to the iDotMatrix via graffiti pixel commands."""
     
     def __init__(self, address: str = DEVICE_ADDR):
         self.address = address
         self.cm: Optional[ConnectionManager] = None
-        self._connected = False
     
     async def connect(self):
-        """Establish BLE connection and keep it open."""
         self.cm = ConnectionManager()
         self.cm.address = self.address
         await self.cm.connect()
-        self._connected = True
         return self
     
     async def disconnect(self):
-        """Close BLE connection."""
         if self.cm:
             try:
                 await self.cm.disconnect()
             except Exception:
                 pass
             self.cm = None
-            self._connected = False
     
-    async def enter_diy_mode(self, mode: int = 1) -> bool:
-        """Enter DIY draw mode (raw pixel mode)."""
-        try:
-            data = bytearray([5, 0, 4, 1, mode % 256])
-            if self.cm:
-                await self.cm.send(data=data)
-            return True
-        except Exception as e:
-            print(f"[display] Failed to enter DIY mode: {e}", file=sys.stderr)
-            return False
-    
-    async def upload_image(self, image_path: str) -> bool:
-        """Upload a PNG image to the display over the existing connection."""
+    async def push_image(self, image_path: str) -> bool:
+        """Push a 64×64 PNG to the display pixel-by-pixel via graffiti mode."""
         try:
             img = PilImage.open(image_path)
             if img.size != (DISPLAY_WIDTH, DISPLAY_HEIGHT):
-                print(f"[display] WARNING: Image {image_path} is {img.size}, expected {DISPLAY_WIDTH}×{DISPLAY_HEIGHT}",
+                print(f"[display] WARNING: {image_path} is {img.size}, expected {DISPLAY_WIDTH}×{DISPLAY_HEIGHT}",
                       file=sys.stderr)
             
-            png_buffer = io.BytesIO()
-            img.save(png_buffer, format="PNG")
-            png_buffer.seek(0)
-            png_data = png_buffer.getvalue()
+            # Convert to RGB if needed
+            if img.mode != "RGB":
+                img = img.convert("RGB")
             
-            chunk_size = 4096
-            png_chunks = [png_data[i:i+chunk_size] for i in range(0, len(png_data), chunk_size)]
-            idk = len(png_data) + len(png_chunks)
-            idk_bytes = struct.pack("h", idk)
-            png_len_bytes = struct.pack("i", len(png_data))
+            pixels = list(img.getdata())
             
-            payloads = bytearray()
-            for i, chunk in enumerate(png_chunks):
-                payload = (
-                    idk_bytes + bytearray([0, 0, 2 if i > 0 else 0]) + png_len_bytes + chunk
-                )
-                payloads.extend(payload)
+            # Build graffiti commands in batches
+            total = DISPLAY_WIDTH * DISPLAY_HEIGHT
+            batch_count = 0
             
-            if self.cm:
-                await self.cm.send(data=payloads)
+            for start in range(0, total, PIXELS_PER_WRITE):
+                batch = bytearray()
+                end = min(start + PIXELS_PER_WRITE, total)
+                
+                for i in range(start, end):
+                    r, g, b = pixels[i]
+                    x = i % DISPLAY_WIDTH
+                    y = i // DISPLAY_WIDTH
+                    # Graffiti command: [10, 0, 5, 1, 0, r, g, b, x, y]
+                    batch.extend(bytearray([10, 0, 5, 1, 0, r, g, b, x, y]))
+                
+                if self.cm:
+                    await self.cm.send(data=batch)
+                batch_count += 1
+                # Small delay between batches to avoid overwhelming BLE
+                await asyncio.sleep(0.05)
             
+            print(f"[display] Pushed {image_path}: {total} pixels in {batch_count} batches",
+                  file=sys.stderr)
             return True
+            
         except Exception as e:
-            print(f"[display] Upload failed for {image_path}: {e}", file=sys.stderr)
+            print(f"[display] Push failed for {image_path}: {e}", file=sys.stderr)
             return False
     
     async def push_sequence(self, image_paths: List[str], display_time: float = 3.0,
@@ -105,35 +94,35 @@ class DisplayClient:
         """Push a sequence of images keeping one BLE connection open."""
         success_count = 0
         
+        # Connect once
         for attempt in range(3):
             try:
                 await self.connect()
-                await self.enter_diy_mode()
                 break
             except Exception as e:
                 print(f"[display] Connection attempt {attempt+1}/3 failed: {e}", file=sys.stderr)
                 if attempt < 2:
                     await asyncio.sleep(3 * (attempt + 1))
                 else:
-                    print("[display] Could not connect to display", file=sys.stderr)
+                    print("[display] Could not connect", file=sys.stderr)
                     return False
         
         for path in image_paths:
             print(f"[display] Pushing {path}...", file=sys.stderr)
             try:
-                ok = await self.upload_image(path)
+                ok = await self.push_image(path)
                 if ok:
                     success_count += 1
                     await asyncio.sleep(display_time + pause_between)
                 else:
                     await asyncio.sleep(1)
             except Exception as e:
-                print(f"[display] Error pushing {path}: {e}", file=sys.stderr)
+                print(f"[display] Error: {e}", file=sys.stderr)
                 await asyncio.sleep(1)
         
         await self.disconnect()
         
-        print(f"[display] Sequence complete: {success_count}/{len(image_paths)} pushed successfully",
+        print(f"[display] Sequence: {success_count}/{len(image_paths)} pushed",
               file=sys.stderr)
         return success_count == len(image_paths)
 
@@ -141,7 +130,6 @@ class DisplayClient:
 async def main():
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <image_path> [image_path...]")
-        print(f"       {sys.argv[0]} --sequence dashboard_1_power.png dashboard_2_calories.png ...")
         sys.exit(1)
     
     images = sys.argv[1:]
