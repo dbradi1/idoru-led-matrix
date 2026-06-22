@@ -6,6 +6,9 @@ Polls Last.fm for the currently playing track, fetches album art,
 resizes to 64×64, dithers for LED display, and pushes via graffiti
 pixel mode (the only upload path that works on this device).
 
+When no track is playing (after the hold window expires), cycles
+through saved album covers from the idle carousel directory.
+
 Adapted from elwinbb/IDotMatrix-Now-Playing — rewritten for 64×64
 and our device's graffiti-mode pixel pushing.
 
@@ -15,6 +18,9 @@ Env vars:
   POLL_INTERVAL     - seconds between polls (default: 5)
   SHOW_CLOCK        - overlay tiny clock on album art (default: true)
   IDLE_HOLD_SECONDS - how long to show last art after music stops (default: 180)
+  IDLE_CAROUSEL_DIR - directory of saved album covers for idle cycling
+                      (default: ~/.openclaw/workspace/media)
+  IDLE_CAROUSEL_INTERVAL - seconds per cover in idle carousel (default: 15)
 """
 
 import asyncio
@@ -54,6 +60,15 @@ PIXELS_PER_WRITE = 200
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
 IDLE_HOLD_SECONDS = int(os.environ.get("IDLE_HOLD_SECONDS", "180"))
 SHOW_CLOCK = os.environ.get("SHOW_CLOCK", "true").lower() in ("1", "true", "yes", "on")
+
+# Idle carousel config
+IDLE_CAROUSEL_DIR = os.environ.get(
+    "IDLE_CAROUSEL_DIR",
+    str(Path.home() / ".openclaw" / "workspace" / "media"),
+)
+IDLE_CAROUSEL_INTERVAL = int(os.environ.get("IDLE_CAROUSEL_INTERVAL", "15"))
+# Filename patterns that look like album covers (saved by Idoru)
+COVER_PATTERNS = ("cover", "album")
 
 LASTFM_URL = "https://ws.audioscrobbler.com/2.0/"
 LASTFM_HEADERS = {"User-Agent": "idoru-now-playing/1.0"}
@@ -125,6 +140,31 @@ def fetch_album_art(url):
     r = requests.get(url, headers=LASTFM_HEADERS, timeout=10)
     r.raise_for_status()
     return Image.open(io.BytesIO(r.content)).convert("RGB")
+
+
+def load_carousel_covers():
+    """Load saved album covers from the carousel directory."""
+    covers = []
+    carousel_path = Path(IDLE_CAROUSEL_DIR)
+    if not carousel_path.is_dir():
+        return covers
+
+    for f in sorted(carousel_path.iterdir()):
+        if not f.is_file():
+            continue
+        name = f.name.lower()
+        # Only pick up files that look like album covers
+        if not any(pat in name for pat in COVER_PATTERNS):
+            continue
+        if name.endswith((".jpg", ".jpeg", ".png", ".webp")):
+            try:
+                img = Image.open(f).convert("RGB")
+                covers.append((f.name, img))
+                print(f"[now-playing] Carousel: loaded {f.name}", file=sys.stderr)
+            except Exception as e:
+                print(f"[now-playing] Carousel: skip {f.name}: {e}", file=sys.stderr)
+
+    return covers
 
 
 def directional_dither(img, levels=64):
@@ -267,6 +307,12 @@ async def main_async():
         print(f"Config error: {e}", file=sys.stderr)
         return 1
 
+    # Load idle carousel covers
+    carousel = load_carousel_covers()
+    carousel_idx = 0
+    carousel_last_push = 0.0
+    carousel_current_name = None
+
     print(f"[now-playing] Connecting to {DEVICE_ADDR}...", file=sys.stderr)
     cm = ConnectionManager()
     cm.address = DEVICE_ADDR
@@ -316,10 +362,38 @@ async def main_async():
                         await asyncio.sleep(POLL_INTERVAL)
                         continue
 
-                    # Genuinely idle — just wait
+                    # Genuinely idle — cycle through saved covers
                     if last_track is not None:
-                        print("[now-playing] Idle — no track playing", file=sys.stderr)
+                        print("[now-playing] Idle — no track playing, starting carousel", file=sys.stderr)
                         last_track = None
+                        carousel_idx = 0
+                        carousel_last_push = 0.0
+
+                    if carousel:
+                        # Time to show next cover?
+                        if time.monotonic() - carousel_last_push >= IDLE_CAROUSEL_INTERVAL:
+                            cover_name, cover_img = carousel[carousel_idx % len(carousel)]
+                            img = prepare_album_art(
+                                "",
+                                base_img=cover_img,
+                                now=now,
+                            )
+                            await push_image_graffiti(cm, img)
+                            print(f"[now-playing] Carousel: {cover_name} ({carousel_idx % len(carousel) + 1}/{len(carousel)})", file=sys.stderr)
+                            carousel_current_name = cover_name
+                            carousel_idx += 1
+                            carousel_last_push = time.monotonic()
+                            last_minute_key = minute_key
+                        # Update clock on current carousel cover when minute changes
+                        elif SHOW_CLOCK and minute_key != last_minute_key and carousel_current_name:
+                            # Find the current cover to re-render with updated clock
+                            for name, cover_img in carousel:
+                                if name == carousel_current_name:
+                                    img = prepare_album_art("", base_img=cover_img, now=now)
+                                    await push_image_graffiti(cm, img)
+                                    print(f"[now-playing] Carousel clock: {now.strftime('%H:%M')} on {name}", file=sys.stderr)
+                                    last_minute_key = minute_key
+                                    break
 
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
