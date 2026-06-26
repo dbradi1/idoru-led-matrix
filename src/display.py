@@ -72,9 +72,6 @@ class DisplayClient:
                 
                 if self.cm:
                     await self.cm.send(data=cmd)
-                    # Small delay every 20 pixels to let BLE settle
-                    if i % 20 == 19:
-                        await asyncio.sleep(0.02)
             
             print(f"[display] Pushed {image_path}: {total} pixels (individual sends)",
                   file=sys.stderr)

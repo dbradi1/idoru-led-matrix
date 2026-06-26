@@ -327,9 +327,6 @@ async def push_image_graffiti(cm, img):
 
         try:
             await cm.send(data=cmd)
-            # Small delay every 20 pixels to avoid overwhelming BLE
-            if i % 20 == 19:
-                await asyncio.sleep(0.02)
         except Exception as e:
             print(f"[now-playing] BLE send error at pixel {i}: {e}", file=sys.stderr)
             return False
