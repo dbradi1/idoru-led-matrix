@@ -12,6 +12,12 @@ through saved album covers from the idle carousel directory.
 Adapted from elwinbb/IDotMatrix-Now-Playing — rewritten for 64×64
 and our device's graffiti-mode pixel pushing.
 
+Resilience features:
+  - Exponential backoff on Last.fm API errors (5s → 10s → 30s → 60s → 120s)
+  - Falls back to carousel mode after 60s of continuous Last.fm errors
+  - BLE watchdog: auto-reconnects if connection drops mid-loop (up to 10 attempts)
+  - Clean exit for systemd restart only when BLE is truly unreachable
+
 Env vars:
   LASTFM_API_KEY   - Last.fm API key
   LASTFM_USER       - Last.fm username
@@ -60,6 +66,14 @@ PIXELS_PER_WRITE = 200
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
 IDLE_HOLD_SECONDS = int(os.environ.get("IDLE_HOLD_SECONDS", "180"))
 SHOW_CLOCK = os.environ.get("SHOW_CLOCK", "true").lower() in ("1", "true", "yes", "on")
+
+# Backoff config for Last.fm errors
+BACKOFF_STEPS = [5, 10, 30, 60, 120]  # seconds between polls on consecutive errors
+LASTFM_ERROR_GRACE = 60  # seconds of errors before switching to carousel fallback
+
+# BLE reconnect config
+BLE_RECONNECT_DELAY = 5  # seconds between reconnect attempts
+BLE_MAX_RECONNECT = 10  # attempts before giving up and letting systemd restart
 
 # Idle carousel config
 IDLE_CAROUSEL_DIR = os.environ.get(
@@ -270,10 +284,29 @@ def prepare_album_art(url, base_img=None, now=None):
     return img
 
 
+async def ble_reconnect(cm):
+    """Attempt to reconnect to the BLE display. Returns True on success."""
+    for attempt in range(BLE_MAX_RECONNECT):
+        try:
+            await cm.disconnect()
+        except Exception:
+            pass
+        await asyncio.sleep(BLE_RECONNECT_DELAY)
+        try:
+            print(f"[now-playing] BLE reconnect attempt {attempt+1}/{BLE_MAX_RECONNECT}...", file=sys.stderr)
+            await cm.connect()
+            print("[now-playing] BLE reconnected!", file=sys.stderr)
+            return True
+        except Exception as e:
+            print(f"[now-playing] BLE reconnect failed: {e}", file=sys.stderr)
+    return False
+
+
 async def push_image_graffiti(cm, img):
     """
     Push a 64×64 PIL Image to the display via graffiti pixel mode.
     Uses the same batching approach as idoru-led-matrix/src/display.py.
+    Returns True on success, False on BLE failure.
     """
     if img.mode != "RGB":
         img = img.convert("RGB")
@@ -294,8 +327,12 @@ async def push_image_graffiti(cm, img):
             y = i // DISPLAY_WIDTH
             batch.extend(bytearray([10, 0, 5, 1, 0, r, g, b, x, y]))
 
-        await cm.send(data=batch)
-        await asyncio.sleep(0.05)
+        try:
+            await cm.send(data=batch)
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            print(f"[now-playing] BLE send error: {e}", file=sys.stderr)
+            return False
 
     return True
 
@@ -337,105 +374,151 @@ async def main_async():
     last_minute_key = None
     playing_hold_until = None
 
+    # Backoff state for Last.fm errors
+    consecutive_lfm_errors = 0
+    lfm_error_start = None
+    in_carousel_fallback = False
+
     try:
         while True:
+            now = datetime.now()
+            minute_key = now.strftime("%Y%m%d%H%M")
+
+            # --- Last.fm poll with backoff ---
             try:
-                now = datetime.now()
-                minute_key = now.strftime("%Y%m%d%H%M")
-
                 data = get_now_playing()
+                if consecutive_lfm_errors > 0:
+                    print(f"[now-playing] Last.fm recovered after {consecutive_lfm_errors} errors", file=sys.stderr)
+                consecutive_lfm_errors = 0
+                lfm_error_start = None
+                in_carousel_fallback = False
+            except Exception as e:
+                consecutive_lfm_errors += 1
+                if lfm_error_start is None:
+                    lfm_error_start = time.monotonic()
+                error_duration = time.monotonic() - lfm_error_start
+                print(f"[now-playing] Last.fm error #{consecutive_lfm_errors}: {e}", file=sys.stderr)
 
-                if data is None:
-                    # No track playing — hold last art if within hold window
-                    if playing_hold_until is not None and time.monotonic() < playing_hold_until:
-                        # Update clock if showing
-                        if SHOW_CLOCK and last_art_image is not None and minute_key != last_minute_key:
-                            img = prepare_album_art(
-                                last_image_url or "",
-                                base_img=last_art_image,
-                                now=now,
-                            )
-                            await push_image_graffiti(cm, img)
-                            print(f"[now-playing] Clock updated: {now.strftime('%H:%M')}", file=sys.stderr)
-                            last_minute_key = minute_key
+                backoff_idx = min(consecutive_lfm_errors - 1, len(BACKOFF_STEPS) - 1)
+                backoff_delay = BACKOFF_STEPS[backoff_idx]
 
-                        await asyncio.sleep(POLL_INTERVAL)
-                        continue
-
-                    # Genuinely idle — cycle through saved covers
-                    if last_track is not None:
-                        print("[now-playing] Idle — no track playing, starting carousel", file=sys.stderr)
+                if error_duration > LASTFM_ERROR_GRACE:
+                    if not in_carousel_fallback:
+                        print(f"[now-playing] Last.fm down for {error_duration:.0f}s — switching to carousel fallback", file=sys.stderr)
+                        in_carousel_fallback = True
                         last_track = None
                         carousel_idx = 0
                         carousel_last_push = 0.0
 
-                    if carousel:
-                        # Time to show next cover?
-                        if time.monotonic() - carousel_last_push >= IDLE_CAROUSEL_INTERVAL:
-                            cover_name, cover_img = carousel[carousel_idx % len(carousel)]
-                            img = prepare_album_art(
-                                "",
-                                base_img=cover_img,
-                                now=now,
-                            )
+                if in_carousel_fallback:
+                    if carousel and time.monotonic() - carousel_last_push >= IDLE_CAROUSEL_INTERVAL:
+                        cover_name, cover_img = carousel[carousel_idx % len(carousel)]
+                        img = prepare_album_art("", base_img=cover_img, now=now)
+                        push_ok = await push_image_graffiti(cm, img)
+                        if not push_ok:
+                            if not await ble_reconnect(cm):
+                                print("[now-playing] BLE lost during fallback carousel, exiting for systemd restart", file=sys.stderr)
+                                return 1
                             await push_image_graffiti(cm, img)
-                            print(f"[now-playing] Carousel: {cover_name} ({carousel_idx % len(carousel) + 1}/{len(carousel)})", file=sys.stderr)
-                            carousel_current_name = cover_name
-                            carousel_idx += 1
-                            carousel_last_push = time.monotonic()
-                            last_minute_key = minute_key
-                        # Update clock on current carousel cover when minute changes
-                        elif SHOW_CLOCK and minute_key != last_minute_key and carousel_current_name:
-                            # Find the current cover to re-render with updated clock
-                            for name, cover_img in carousel:
-                                if name == carousel_current_name:
-                                    img = prepare_album_art("", base_img=cover_img, now=now)
-                                    await push_image_graffiti(cm, img)
-                                    print(f"[now-playing] Carousel clock: {now.strftime('%H:%M')} on {name}", file=sys.stderr)
-                                    last_minute_key = minute_key
-                                    break
+                        print(f"[now-playing] Fallback carousel: {cover_name} ({carousel_idx % len(carousel) + 1}/{len(carousel)})", file=sys.stderr)
+                        carousel_current_name = cover_name
+                        carousel_idx += 1
+                        carousel_last_push = time.monotonic()
+                        last_minute_key = minute_key
+                    await asyncio.sleep(POLL_INTERVAL)
+                else:
+                    await asyncio.sleep(backoff_delay)
+                continue
 
+            if data is None:
+                # No track playing — hold last art if within hold window
+                if playing_hold_until is not None and time.monotonic() < playing_hold_until:
+                    if SHOW_CLOCK and last_art_image is not None and minute_key != last_minute_key:
+                        img = prepare_album_art(
+                            last_image_url or "",
+                            base_img=last_art_image,
+                            now=now,
+                        )
+                        push_ok = await push_image_graffiti(cm, img)
+                        if not push_ok:
+                            if not await ble_reconnect(cm):
+                                print("[now-playing] BLE lost during clock update, exiting for systemd restart", file=sys.stderr)
+                                return 1
+                            await push_image_graffiti(cm, img)
+                        print(f"[now-playing] Clock updated: {now.strftime('%H:%M')}", file=sys.stderr)
+                        last_minute_key = minute_key
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
-                image_url, title, artist = data
-                track_id = f"{artist} - {title}"
-                playing_hold_until = time.monotonic() + IDLE_HOLD_SECONDS
+                # Genuinely idle — cycle through saved covers
+                if last_track is not None:
+                    print("[now-playing] Idle — no track playing, starting carousel", file=sys.stderr)
+                    last_track = None
+                    carousel_idx = 0
+                    carousel_last_push = 0.0
 
-                should_refresh_clock = SHOW_CLOCK and minute_key != last_minute_key
-                track_changed = track_id != last_track
-
-                if track_changed or should_refresh_clock:
-                    if not image_url:
-                        print(f"[now-playing] No art for: {track_id}", file=sys.stderr)
-                        last_track = track_id
-                        last_image_url = image_url
-                        last_art_image = None
+                if carousel:
+                    if time.monotonic() - carousel_last_push >= IDLE_CAROUSEL_INTERVAL:
+                        cover_name, cover_img = carousel[carousel_idx % len(carousel)]
+                        img = prepare_album_art("", base_img=cover_img, now=now)
+                        push_ok = await push_image_graffiti(cm, img)
+                        if not push_ok:
+                            if not await ble_reconnect(cm):
+                                print("[now-playing] BLE lost during carousel, exiting for systemd restart", file=sys.stderr)
+                                return 1
+                            await push_image_graffiti(cm, img)
+                        print(f"[now-playing] Carousel: {cover_name} ({carousel_idx % len(carousel) + 1}/{len(carousel)})", file=sys.stderr)
+                        carousel_current_name = cover_name
+                        carousel_idx += 1
+                        carousel_last_push = time.monotonic()
                         last_minute_key = minute_key
-                        continue
+                    elif SHOW_CLOCK and minute_key != last_minute_key and carousel_current_name:
+                        for name, cover_img in carousel:
+                            if name == carousel_current_name:
+                                img = prepare_album_art("", base_img=cover_img, now=now)
+                                await push_image_graffiti(cm, img)
+                                print(f"[now-playing] Carousel clock: {now.strftime('%H:%M')} on {name}", file=sys.stderr)
+                                last_minute_key = minute_key
+                                break
 
-                    # Fetch new art if track changed or art URL changed
-                    if track_changed or image_url != last_image_url or last_art_image is None:
-                        last_art_image = fetch_album_art(image_url)
-                        last_image_url = image_url
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
 
-                    img = prepare_album_art(
-                        image_url,
-                        base_img=last_art_image,
-                        now=now,
-                    )
+            image_url, title, artist = data
+            track_id = f"{artist} - {title}"
+            playing_hold_until = time.monotonic() + IDLE_HOLD_SECONDS
+
+            should_refresh_clock = SHOW_CLOCK and minute_key != last_minute_key
+            track_changed = track_id != last_track
+
+            if track_changed or should_refresh_clock:
+                if not image_url:
+                    print(f"[now-playing] No art for: {track_id}", file=sys.stderr)
+                    last_track = track_id
+                    last_image_url = image_url
+                    last_art_image = None
+                    last_minute_key = minute_key
+                    continue
+
+                if track_changed or image_url != last_image_url or last_art_image is None:
+                    last_art_image = fetch_album_art(image_url)
+                    last_image_url = image_url
+
+                img = prepare_album_art(image_url, base_img=last_art_image, now=now)
+                push_ok = await push_image_graffiti(cm, img)
+                if not push_ok:
+                    if not await ble_reconnect(cm):
+                        print("[now-playing] BLE lost during art push, exiting for systemd restart", file=sys.stderr)
+                        return 1
                     await push_image_graffiti(cm, img)
 
-                    if track_changed:
-                        print(f"[now-playing] ▶ {artist} - {title}", file=sys.stderr)
-                    elif should_refresh_clock:
-                        print(f"[now-playing] Clock: {now.strftime('%H:%M')}", file=sys.stderr)
+                if track_changed:
+                    print(f"[now-playing] ▶ {artist} - {title}", file=sys.stderr)
+                elif should_refresh_clock:
+                    print(f"[now-playing] Clock: {now.strftime('%H:%M')}", file=sys.stderr)
 
-                    last_track = track_id
-                    last_minute_key = minute_key
-
-            except Exception as e:
-                print(f"[now-playing] Error: {e}", file=sys.stderr)
+                last_track = track_id
+                last_minute_key = minute_key
 
             await asyncio.sleep(POLL_INTERVAL)
 
