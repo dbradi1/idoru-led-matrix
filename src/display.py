@@ -7,8 +7,9 @@ The PNG upload (DIY mode) commands are accepted by the BLE stack but the
 display ignores them. Fullscreen color and graffiti pixel commands work,
 so we render dashboards pixel-by-pixel.
 
-At 64×64 = 4,096 pixels per dashboard, we batch pixels into groups of ~200
-per BLE write to keep it fast (~20 writes per dashboard).
+At 64×64 = 4,096 pixels per dashboard, each pixel is sent as an individual
+BLE write — the iDotMatrix firmware only processes one graffiti pixel per
+write; batching multiple pixels in a single send causes silent drops.
 """
 
 import asyncio
@@ -22,7 +23,7 @@ from idotmatrix import ConnectionManager
 DEVICE_ADDR = "26:C8:1C:3B:99:F5"
 DISPLAY_WIDTH = 64
 DISPLAY_HEIGHT = 64
-PIXELS_PER_WRITE = 200  # Batch size for graffiti commands
+# No batching — each pixel is sent individually (firmware drops batched pixels)
 
 
 class DisplayClient:
@@ -60,28 +61,22 @@ class DisplayClient:
             
             pixels = list(img.getdata())
             
-            # Build graffiti commands in batches
+            # Send each pixel individually — firmware only processes one per BLE write
             total = DISPLAY_WIDTH * DISPLAY_HEIGHT
-            batch_count = 0
             
-            for start in range(0, total, PIXELS_PER_WRITE):
-                batch = bytearray()
-                end = min(start + PIXELS_PER_WRITE, total)
-                
-                for i in range(start, end):
-                    r, g, b = pixels[i]
-                    x = i % DISPLAY_WIDTH
-                    y = i // DISPLAY_WIDTH
-                    # Graffiti command: [10, 0, 5, 1, 0, r, g, b, x, y]
-                    batch.extend(bytearray([10, 0, 5, 1, 0, r, g, b, x, y]))
+            for i in range(total):
+                r, g, b = pixels[i]
+                x = i % DISPLAY_WIDTH
+                y = i // DISPLAY_WIDTH
+                cmd = bytearray([10, 0, 5, 1, 0, r, g, b, x, y])
                 
                 if self.cm:
-                    await self.cm.send(data=batch)
-                batch_count += 1
-                # Small delay between batches to avoid overwhelming BLE
-                await asyncio.sleep(0.05)
+                    await self.cm.send(data=cmd)
+                    # Small delay every 20 pixels to let BLE settle
+                    if i % 20 == 19:
+                        await asyncio.sleep(0.02)
             
-            print(f"[display] Pushed {image_path}: {total} pixels in {batch_count} batches",
+            print(f"[display] Pushed {image_path}: {total} pixels (individual sends)",
                   file=sys.stderr)
             return True
             

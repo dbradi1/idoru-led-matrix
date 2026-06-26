@@ -305,7 +305,9 @@ async def ble_reconnect(cm):
 async def push_image_graffiti(cm, img):
     """
     Push a 64×64 PIL Image to the display via graffiti pixel mode.
-    Uses the same batching approach as idoru-led-matrix/src/display.py.
+    Each pixel is sent as an individual BLE write — the iDotMatrix firmware
+    only processes one graffiti pixel per write; batching multiple pixels
+    in a single send causes all but the first to be silently dropped.
     Returns True on success, False on BLE failure.
     """
     if img.mode != "RGB":
@@ -317,21 +319,19 @@ async def push_image_graffiti(cm, img):
     pixels = list(img.getdata())
     total = DISPLAY_WIDTH * DISPLAY_HEIGHT
 
-    for start in range(0, total, PIXELS_PER_WRITE):
-        batch = bytearray()
-        end = min(start + PIXELS_PER_WRITE, total)
-
-        for i in range(start, end):
-            r, g, b = pixels[i]
-            x = i % DISPLAY_WIDTH
-            y = i // DISPLAY_WIDTH
-            batch.extend(bytearray([10, 0, 5, 1, 0, r, g, b, x, y]))
+    for i in range(total):
+        r, g, b = pixels[i]
+        x = i % DISPLAY_WIDTH
+        y = i // DISPLAY_WIDTH
+        cmd = bytearray([10, 0, 5, 1, 0, r, g, b, x, y])
 
         try:
-            await cm.send(data=batch)
-            await asyncio.sleep(0.05)
+            await cm.send(data=cmd)
+            # Small delay every 20 pixels to avoid overwhelming BLE
+            if i % 20 == 19:
+                await asyncio.sleep(0.02)
         except Exception as e:
-            print(f"[now-playing] BLE send error: {e}", file=sys.stderr)
+            print(f"[now-playing] BLE send error at pixel {i}: {e}", file=sys.stderr)
             return False
 
     return True
