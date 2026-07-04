@@ -295,11 +295,26 @@ async def ble_reconnect(cm):
         try:
             print(f"[now-playing] BLE reconnect attempt {attempt+1}/{BLE_MAX_RECONNECT}...", file=sys.stderr)
             await cm.connect()
+            await enable_graffiti_mode(cm)
             print("[now-playing] BLE reconnected!", file=sys.stderr)
             return True
         except Exception as e:
             print(f"[now-playing] BLE reconnect failed: {e}", file=sys.stderr)
     return False
+
+
+async def enable_graffiti_mode(cm):
+    """
+    Put the display into DIY/graffiti draw mode.
+    Without this, the display may be in clock/text mode and pixel writes
+    are silently ignored. Must be called after (re)connecting to the display.
+    """
+    mode_cmd = bytearray([5, 0, 4, 1, 1])  # setMode(1) = enable DIY draw
+    try:
+        await cm.send(data=mode_cmd)
+        print("[now-playing] Graffiti/DIY mode enabled", file=sys.stderr)
+    except Exception as e:
+        print(f"[now-playing] Failed to set graffiti mode: {e}", file=sys.stderr)
 
 
 async def push_image_graffiti(cm, img):
@@ -362,6 +377,9 @@ async def main_async():
             else:
                 print("[now-playing] Could not connect to display", file=sys.stderr)
                 return 1
+
+    # Enable DIY/graffiti draw mode — without this, pixel writes are ignored
+    await enable_graffiti_mode(cm)
 
     print(f"[now-playing] Connected. Polling Last.fm for {LASTFM_USER}...", file=sys.stderr)
 
