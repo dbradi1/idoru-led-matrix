@@ -216,27 +216,15 @@ def load_carousel_covers():
 
 def directional_dither(img, levels=64):
     """
-    Horizontal error-diffusion dithering to reduce banding on LED matrices.
-    Stays in RGB space — no palette conversion.
+    Floyd-Steinberg dithering using Pillow's C-optimized quantize().
+    Returns an RGB Image with quantized colors — much faster than
+    per-pixel Python loops over numpy arrays.
     """
     img = img.convert("RGB")
-    arr = np.array(img, dtype=np.float32)
-    h, w, _ = arr.shape
-    step = 255.0 / (levels - 1)
-
-    for y in range(h):
-        for x in range(w):
-            old_pixel = arr[y, x].copy()
-            new_pixel = np.round(old_pixel / step) * step
-            arr[y, x] = new_pixel
-            error = old_pixel - new_pixel
-            if x + 1 < w:
-                arr[y, x + 1] += error * 0.9
-            if y + 1 < h:
-                arr[y + 1, x] += error * 0.1
-
-    arr = np.clip(arr, 0, 255).astype(np.uint8)
-    return Image.fromarray(arr, "RGB")
+    # Quantize with Floyd-Steinberg dithering, then convert back to RGB
+    # so downstream code (getdata, BLE push) gets the same interface.
+    paletted = img.quantize(colors=levels, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.FLOYDSTEINBERG)
+    return paletted.convert("RGB")
 
 
 def overlay_clock(img, now=None):
