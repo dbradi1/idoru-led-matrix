@@ -1,12 +1,12 @@
 [Unit]
-Description=Idoru LED Matrix Health Dashboard Cycler
+Description=Idoru Now Playing Display (LED Matrix - Last.fm)
 After=network-online.target bluetooth.target
 Wants=network-online.target bluetooth.target
 Requires=bluetooth.service
 
 [Service]
 Type=simple
-ExecStart=/home/drew/.idoru-display-env/bin/python3 /home/drew/github-repos/idoru-led-matrix/src/cycle.py --loop --pause 20 --display-time 3.5
+ExecStart=/home/drew/.idoru-display-env/bin/python3 /home/drew/github-repos/idoru-led-matrix/src/now_playing.py
 Restart=always
 RestartSec=30
 Environment=PYTHONUNBUFFERED=1

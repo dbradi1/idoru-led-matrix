@@ -1,3 +1,5 @@
 pillow>=9.0.0
-idotmatrix>=0.3.0
+idotmatrix>=0.0.9
 bleak>=0.19.0
+requests>=2.20.0
+python-dotenv>=1.0.0

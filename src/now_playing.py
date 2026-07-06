@@ -34,14 +34,12 @@ import io
 import os
 import sys
 import time
-import tempfile
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 import requests
 from PIL import Image, ImageEnhance, ImageDraw
-import numpy as np
 from idotmatrix import ConnectionManager
 
 # --- Monkey-patch: remove 10ms blocking sleep from library's send() ---
@@ -94,8 +92,6 @@ LASTFM_USER = os.environ.get("LASTFM_USER", "")
 DEVICE_ADDR = "26:C8:1C:3B:99:F5"
 DISPLAY_WIDTH = 64
 DISPLAY_HEIGHT = 64
-PIXELS_PER_WRITE = 200
-
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
 IDLE_HOLD_SECONDS = int(os.environ.get("IDLE_HOLD_SECONDS", "180"))
 SHOW_CLOCK = os.environ.get("SHOW_CLOCK", "true").lower() in ("1", "true", "yes", "on")
@@ -312,6 +308,7 @@ async def ble_reconnect(cm):
             await cm.disconnect()
         except Exception:
             pass
+        cm.client = None  # Force fresh BleakClient — library doesn't clear this
         await asyncio.sleep(BLE_RECONNECT_DELAY)
         try:
             print(f"[now-playing] BLE reconnect attempt {attempt+1}/{BLE_MAX_RECONNECT}...", file=sys.stderr)
@@ -455,7 +452,9 @@ async def main_async():
                             if not await ble_reconnect(cm):
                                 print("[now-playing] BLE lost during fallback carousel, exiting for systemd restart", file=sys.stderr)
                                 return 1
-                            await push_image_graffiti(cm, img)
+                            retry_ok = await push_image_graffiti(cm, img)
+                            if not retry_ok:
+                                print("[now-playing] Retry push also failed after reconnect (fallback carousel)", file=sys.stderr)
                         print(f"[now-playing] Fallback carousel: {cover_name} ({carousel_idx % len(carousel) + 1}/{len(carousel)})", file=sys.stderr)
                         carousel_current_name = cover_name
                         carousel_idx += 1
@@ -480,7 +479,9 @@ async def main_async():
                             if not await ble_reconnect(cm):
                                 print("[now-playing] BLE lost during clock update, exiting for systemd restart", file=sys.stderr)
                                 return 1
-                            await push_image_graffiti(cm, img)
+                            retry_ok = await push_image_graffiti(cm, img)
+                            if not retry_ok:
+                                print("[now-playing] Retry push also failed after reconnect (clock update)", file=sys.stderr)
                         print(f"[now-playing] Clock updated: {now.strftime('%H:%M')}", file=sys.stderr)
                         last_minute_key = minute_key
                     await asyncio.sleep(POLL_INTERVAL)
@@ -502,20 +503,18 @@ async def main_async():
                             if not await ble_reconnect(cm):
                                 print("[now-playing] BLE lost during carousel, exiting for systemd restart", file=sys.stderr)
                                 return 1
-                            await push_image_graffiti(cm, img)
+                            retry_ok = await push_image_graffiti(cm, img)
+                            if not retry_ok:
+                                print("[now-playing] Retry push also failed after reconnect (carousel)", file=sys.stderr)
                         print(f"[now-playing] Carousel: {cover_name} ({carousel_idx % len(carousel) + 1}/{len(carousel)})", file=sys.stderr)
                         carousel_current_name = cover_name
                         carousel_idx += 1
                         carousel_last_push = time.monotonic()
                         last_minute_key = minute_key
-                    elif SHOW_CLOCK and minute_key != last_minute_key and carousel_current_name:
-                        for name, cover_img in carousel:
-                            if name == carousel_current_name:
-                                img = prepare_album_art("", base_img=cover_img, now=now)
-                                await push_image_graffiti(cm, img)
-                                print(f"[now-playing] Carousel clock: {now.strftime('%H:%M')} on {name}", file=sys.stderr)
-                                last_minute_key = minute_key
-                                break
+                    # Clock overlay on carousel images disabled — re-pushing 4096 pixels
+                    # just to update ~20 clock pixels takes ~26s (longer than 1 min),
+                    # causing the clock to lag. The carousel rotates often enough that
+                    # a clock on transient images isn't worth the extra push.
 
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
@@ -546,7 +545,9 @@ async def main_async():
                     if not await ble_reconnect(cm):
                         print("[now-playing] BLE lost during art push, exiting for systemd restart", file=sys.stderr)
                         return 1
-                    await push_image_graffiti(cm, img)
+                    retry_ok = await push_image_graffiti(cm, img)
+                    if not retry_ok:
+                        print("[now-playing] Retry push also failed after reconnect (art push)", file=sys.stderr)
 
                 if track_changed:
                     print(f"[now-playing] ▶ {artist} - {title}", file=sys.stderr)
