@@ -44,6 +44,39 @@ from PIL import Image, ImageEnhance, ImageDraw
 import numpy as np
 from idotmatrix import ConnectionManager
 
+# --- Monkey-patch: remove 10ms blocking sleep from library's send() ---
+# The idotmatrix library calls time.sleep(0.01) after every BLE write.
+# With 4096 pixels per image, that's ~41 seconds of dead time per push.
+# We override send() to use asyncio.sleep with a much shorter delay (1ms),
+# which yields to the event loop without blocking for 10x longer than needed.
+import idotmatrix.connectionManager as _idot_cm_mod
+import logging as _logging
+
+_original_send = _idot_cm_mod.ConnectionManager.send
+
+async def _patched_send(self, data, response=False):
+    if self.client and self.client.is_connected:
+        _logging.getLogger("idotmatrix").debug("sending message(s) to device")
+        chunk_size = self.client.services.get_characteristic(
+            _idot_cm_mod.UUID_WRITE_DATA
+        ).max_write_without_response_size
+        for i in range(0, len(data), chunk_size):
+            await self.client.write_gatt_char(
+                _idot_cm_mod.UUID_WRITE_DATA,
+                data[i:i + chunk_size],
+                response=response,
+            )
+        # 1ms yield instead of 10ms blocking sleep
+        await asyncio.sleep(0.001)
+        return True
+
+_idot_cm_mod.ConnectionManager.send = _patched_send
+# --- End monkey-patch ---
+
+# Silence library DEBUG log spam (was ~44K lines per 10min in journal)
+_logging.getLogger("idotmatrix").setLevel(_logging.WARNING)
+_logging.getLogger("bleak").setLevel(_logging.WARNING)
+
 # Load .env from the repo root
 DOTENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 if DOTENV_PATH.exists():
