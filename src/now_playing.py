@@ -96,6 +96,12 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
 IDLE_HOLD_SECONDS = int(os.environ.get("IDLE_HOLD_SECONDS", "180"))
 SHOW_CLOCK = os.environ.get("SHOW_CLOCK", "true").lower() in ("1", "true", "yes", "on")
 
+# Periodic BLE flush — every N seconds, disconnect and reconnect to prevent
+# the iDotMatrix display from freezing on a single image. The display's
+# internal state can get stuck where it accepts BLE writes but doesn't render
+# new frames. A clean disconnect+reconnect kicks it back to life.
+BLE_FLUSH_INTERVAL = int(os.environ.get("BLE_FLUSH_INTERVAL", "1800"))  # 30 min
+
 # Backoff config for Last.fm errors
 BACKOFF_STEPS = [5, 10, 30, 60, 120]  # seconds between polls on consecutive errors
 LASTFM_ERROR_GRACE = 60  # seconds of errors before switching to carousel fallback
@@ -367,6 +373,44 @@ async def push_image_graffiti(cm, img):
     return True
 
 
+async def ble_flush_loop(cm, flush_lock):
+    """Background task: periodically disconnect+reconnect BLE to prevent display freeze.
+
+    The iDotMatrix display can get stuck accepting BLE writes but not rendering
+    new frames. A clean disconnect+reconnect every 30 minutes flushes its state.
+    Uses a lock so we don't collide with the main loop's BLE writes.
+    """
+    while True:
+        await asyncio.sleep(BLE_FLUSH_INTERVAL)
+        async with flush_lock:
+            print(f"[now-playing] Periodic BLE flush — disconnecting...", file=sys.stderr)
+            try:
+                await cm.disconnect()
+            except Exception as e:
+                print(f"[now-playing] Flush disconnect error (non-fatal): {e}", file=sys.stderr)
+            cm.client = None
+            await asyncio.sleep(3)
+            try:
+                await cm.connect()
+                await enable_graffiti_mode(cm)
+                print(f"[now-playing] Periodic BLE flush — reconnected ✅", file=sys.stderr)
+            except Exception as e:
+                print(f"[now-playing] Flush reconnect failed: {e}", file=sys.stderr)
+                # Try a few more times
+                for retry in range(3):
+                    await asyncio.sleep(BLE_RECONNECT_DELAY)
+                    try:
+                        await cm.connect()
+                        await enable_graffiti_mode(cm)
+                        print(f"[now-playing] Flush reconnect retry {retry+1}/3 succeeded ✅", file=sys.stderr)
+                        break
+                    except Exception as e2:
+                        print(f"[now-playing] Flush reconnect retry {retry+1}/3 failed: {e2}", file=sys.stderr)
+                else:
+                    print(f"[now-playing] Flush reconnect exhausted — exiting for systemd restart", file=sys.stderr)
+                    return  # main loop will detect disconnection and exit
+
+
 async def main_async():
     try:
         validate_config()
@@ -398,6 +442,13 @@ async def main_async():
 
     # Enable DIY/graffiti draw mode — without this, pixel writes are ignored
     await enable_graffiti_mode(cm)
+
+    # Lock to prevent BLE flush and main loop from writing simultaneously
+    ble_flush_lock = asyncio.Lock()
+
+    # Start periodic BLE flush task
+    flush_task = asyncio.create_task(ble_flush_loop(cm, ble_flush_lock))
+    print(f"[now-playing] BLE flush scheduled every {BLE_FLUSH_INTERVAL}s ({BLE_FLUSH_INTERVAL//60} min)", file=sys.stderr)
 
     print(f"[now-playing] Connected. Polling Last.fm for {LASTFM_USER}...", file=sys.stderr)
 
@@ -447,12 +498,14 @@ async def main_async():
                     if carousel and time.monotonic() - carousel_last_push >= IDLE_CAROUSEL_INTERVAL:
                         cover_name, cover_img = carousel[carousel_idx % len(carousel)]
                         img = prepare_album_art("", base_img=cover_img, now=now)
-                        push_ok = await push_image_graffiti(cm, img)
+                        async with ble_flush_lock:
+                            push_ok = await push_image_graffiti(cm, img)
                         if not push_ok:
                             if not await ble_reconnect(cm):
                                 print("[now-playing] BLE lost during fallback carousel, exiting for systemd restart", file=sys.stderr)
                                 return 1
-                            retry_ok = await push_image_graffiti(cm, img)
+                            async with ble_flush_lock:
+                                retry_ok = await push_image_graffiti(cm, img)
                             if not retry_ok:
                                 print("[now-playing] Retry push also failed after reconnect (fallback carousel)", file=sys.stderr)
                         print(f"[now-playing] Fallback carousel: {cover_name} ({carousel_idx % len(carousel) + 1}/{len(carousel)})", file=sys.stderr)
@@ -474,12 +527,14 @@ async def main_async():
                             base_img=last_art_image,
                             now=now,
                         )
-                        push_ok = await push_image_graffiti(cm, img)
+                        async with ble_flush_lock:
+                            push_ok = await push_image_graffiti(cm, img)
                         if not push_ok:
                             if not await ble_reconnect(cm):
                                 print("[now-playing] BLE lost during clock update, exiting for systemd restart", file=sys.stderr)
                                 return 1
-                            retry_ok = await push_image_graffiti(cm, img)
+                            async with ble_flush_lock:
+                                retry_ok = await push_image_graffiti(cm, img)
                             if not retry_ok:
                                 print("[now-playing] Retry push also failed after reconnect (clock update)", file=sys.stderr)
                         print(f"[now-playing] Clock updated: {now.strftime('%H:%M')}", file=sys.stderr)
@@ -498,12 +553,14 @@ async def main_async():
                     if time.monotonic() - carousel_last_push >= IDLE_CAROUSEL_INTERVAL:
                         cover_name, cover_img = carousel[carousel_idx % len(carousel)]
                         img = prepare_album_art("", base_img=cover_img, now=now)
-                        push_ok = await push_image_graffiti(cm, img)
+                        async with ble_flush_lock:
+                            push_ok = await push_image_graffiti(cm, img)
                         if not push_ok:
                             if not await ble_reconnect(cm):
                                 print("[now-playing] BLE lost during carousel, exiting for systemd restart", file=sys.stderr)
                                 return 1
-                            retry_ok = await push_image_graffiti(cm, img)
+                            async with ble_flush_lock:
+                                retry_ok = await push_image_graffiti(cm, img)
                             if not retry_ok:
                                 print("[now-playing] Retry push also failed after reconnect (carousel)", file=sys.stderr)
                         print(f"[now-playing] Carousel: {cover_name} ({carousel_idx % len(carousel) + 1}/{len(carousel)})", file=sys.stderr)
@@ -540,12 +597,14 @@ async def main_async():
                     last_image_url = image_url
 
                 img = prepare_album_art(image_url, base_img=last_art_image, now=now)
-                push_ok = await push_image_graffiti(cm, img)
+                async with ble_flush_lock:
+                    push_ok = await push_image_graffiti(cm, img)
                 if not push_ok:
                     if not await ble_reconnect(cm):
                         print("[now-playing] BLE lost during art push, exiting for systemd restart", file=sys.stderr)
                         return 1
-                    retry_ok = await push_image_graffiti(cm, img)
+                    async with ble_flush_lock:
+                        retry_ok = await push_image_graffiti(cm, img)
                     if not retry_ok:
                         print("[now-playing] Retry push also failed after reconnect (art push)", file=sys.stderr)
 
@@ -562,6 +621,11 @@ async def main_async():
     except KeyboardInterrupt:
         print("\n[now-playing] Shutting down...", file=sys.stderr)
     finally:
+        flush_task.cancel()
+        try:
+            await flush_task
+        except asyncio.CancelledError:
+            pass
         try:
             await cm.disconnect()
         except Exception:
