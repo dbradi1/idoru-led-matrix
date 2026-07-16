@@ -100,7 +100,7 @@ SHOW_CLOCK = os.environ.get("SHOW_CLOCK", "true").lower() in ("1", "true", "yes"
 # the iDotMatrix display from freezing on a single image. The display's
 # internal state can get stuck where it accepts BLE writes but doesn't render
 # new frames. A clean disconnect+reconnect kicks it back to life.
-BLE_FLUSH_INTERVAL = int(os.environ.get("BLE_FLUSH_INTERVAL", "1800"))  # 30 min
+BLE_FLUSH_INTERVAL = int(os.environ.get("BLE_FLUSH_INTERVAL", "600"))  # 10 min
 
 # Backoff config for Last.fm errors
 BACKOFF_STEPS = [5, 10, 30, 60, 120]  # seconds between polls on consecutive errors
@@ -109,6 +109,11 @@ LASTFM_ERROR_GRACE = 60  # seconds of errors before switching to carousel fallba
 # BLE reconnect config
 BLE_RECONNECT_DELAY = 5  # seconds between reconnect attempts
 BLE_MAX_RECONNECT = 10  # attempts before giving up and letting systemd restart
+
+# BLE liveness watchdog — if no BLE push (image or flush) has happened in this
+# many seconds, force a reconnect. Catches zombie state where writes "succeed"
+# but the display doesn't render. Set to 0 to disable.
+BLE_WATCHDOG_TIMEOUT = int(os.environ.get("BLE_WATCHDOG_TIMEOUT", "900"))  # 15 min
 
 # Idle carousel config
 IDLE_CAROUSEL_DIR = os.environ.get(
@@ -307,7 +312,7 @@ def prepare_album_art(url, base_img=None, now=None):
     return img
 
 
-async def ble_reconnect(cm):
+async def ble_reconnect(cm, watchdog=None):
     """Attempt to reconnect to the BLE display. Returns True on success."""
     for attempt in range(BLE_MAX_RECONNECT):
         try:
@@ -320,6 +325,8 @@ async def ble_reconnect(cm):
             print(f"[now-playing] BLE reconnect attempt {attempt+1}/{BLE_MAX_RECONNECT}...", file=sys.stderr)
             await cm.connect()
             await enable_graffiti_mode(cm)
+            if watchdog is not None:
+                watchdog['last_activity'] = time.monotonic()
             print("[now-playing] BLE reconnected!", file=sys.stderr)
             return True
         except Exception as e:
@@ -373,12 +380,14 @@ async def push_image_graffiti(cm, img):
     return True
 
 
-async def ble_flush_loop(cm, flush_lock):
+async def ble_flush_loop(cm, flush_lock, watchdog):
     """Background task: periodically disconnect+reconnect BLE to prevent display freeze.
 
     The iDotMatrix display can get stuck accepting BLE writes but not rendering
-    new frames. A clean disconnect+reconnect every 30 minutes flushes its state.
+    new frames. A clean disconnect+reconnect every 10 minutes flushes its state.
     Uses a lock so we don't collide with the main loop's BLE writes.
+    Updates the watchdog timestamp on successful reconnect so the main loop
+    knows BLE is alive.
     """
     while True:
         await asyncio.sleep(BLE_FLUSH_INTERVAL)
@@ -393,6 +402,7 @@ async def ble_flush_loop(cm, flush_lock):
             try:
                 await cm.connect()
                 await enable_graffiti_mode(cm)
+                watchdog['last_activity'] = time.monotonic()
                 print(f"[now-playing] Periodic BLE flush — reconnected ✅", file=sys.stderr)
             except Exception as e:
                 print(f"[now-playing] Flush reconnect failed: {e}", file=sys.stderr)
@@ -402,13 +412,15 @@ async def ble_flush_loop(cm, flush_lock):
                     try:
                         await cm.connect()
                         await enable_graffiti_mode(cm)
+                        watchdog['last_activity'] = time.monotonic()
                         print(f"[now-playing] Flush reconnect retry {retry+1}/3 succeeded ✅", file=sys.stderr)
                         break
                     except Exception as e2:
                         print(f"[now-playing] Flush reconnect retry {retry+1}/3 failed: {e2}", file=sys.stderr)
                 else:
-                    print(f"[now-playing] Flush reconnect exhausted — exiting for systemd restart", file=sys.stderr)
-                    return  # main loop will detect disconnection and exit
+                    print(f"[now-playing] Flush reconnect exhausted — sleeping 60s before retry", file=sys.stderr)
+                    await asyncio.sleep(60)
+                    continue  # never give up — keep trying
 
 
 async def main_async():
@@ -446,9 +458,16 @@ async def main_async():
     # Lock to prevent BLE flush and main loop from writing simultaneously
     ble_flush_lock = asyncio.Lock()
 
+    # BLE liveness watchdog — shared between flush loop and main loop.
+    # Tracks the last time we successfully interacted with the display.
+    # If no activity for BLE_WATCHDOG_TIMEOUT seconds, force a reconnect.
+    ble_watchdog = {'last_activity': time.monotonic()}
+
     # Start periodic BLE flush task
-    flush_task = asyncio.create_task(ble_flush_loop(cm, ble_flush_lock))
+    flush_task = asyncio.create_task(ble_flush_loop(cm, ble_flush_lock, ble_watchdog))
     print(f"[now-playing] BLE flush scheduled every {BLE_FLUSH_INTERVAL}s ({BLE_FLUSH_INTERVAL//60} min)", file=sys.stderr)
+    if BLE_WATCHDOG_TIMEOUT > 0:
+        print(f"[now-playing] BLE watchdog: will force reconnect after {BLE_WATCHDOG_TIMEOUT}s of no activity", file=sys.stderr)
 
     print(f"[now-playing] Connected. Polling Last.fm for {LASTFM_USER}...", file=sys.stderr)
 
@@ -463,10 +482,47 @@ async def main_async():
     lfm_error_start = None
     in_carousel_fallback = False
 
+    # BLE watchdog: force a reconnect if no push in BLE_WATCHDOG_TIMEOUT seconds
+    watchdog_forced_reconnect = False
+
     try:
         while True:
             now = datetime.now()
             minute_key = now.strftime("%Y%m%d%H%M")
+
+            # --- BLE watchdog check ---
+            if BLE_WATCHDOG_TIMEOUT > 0 and not watchdog_forced_reconnect:
+                stale_secs = time.monotonic() - ble_watchdog['last_activity']
+                if stale_secs > BLE_WATCHDOG_TIMEOUT:
+                    print(f"[now-playing] BLE watchdog: no activity for {stale_secs:.0f}s — forcing reconnect", file=sys.stderr)
+                    watchdog_forced_reconnect = True
+
+            # --- BLE watchdog reconnect ---
+            # When the watchdog fires, force a disconnect+reconnect before the next
+            # push. This catches zombie BLE state where writes "succeed" but the
+            # display doesn't render. We do this proactively rather than waiting
+            # for the periodic flush.
+            if watchdog_forced_reconnect:
+                async with ble_flush_lock:
+                    print("[now-playing] Watchdog: disconnecting BLE for forced reconnect...", file=sys.stderr)
+                    try:
+                        await cm.disconnect()
+                    except Exception:
+                        pass
+                    cm.client = None
+                    await asyncio.sleep(3)
+                    try:
+                        await cm.connect()
+                        await enable_graffiti_mode(cm)
+                        ble_watchdog['last_activity'] = time.monotonic()
+                        print("[now-playing] Watchdog: BLE reconnected ✅", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[now-playing] Watchdog: reconnect failed: {e}", file=sys.stderr)
+                        if not await ble_reconnect(cm, ble_watchdog):
+                            print("[now-playing] Watchdog: BLE unrecoverable, exiting for systemd restart", file=sys.stderr)
+                            return 1
+                        ble_watchdog['last_activity'] = time.monotonic()
+                watchdog_forced_reconnect = False
 
             # --- Last.fm poll with backoff ---
             try:
@@ -501,13 +557,15 @@ async def main_async():
                         async with ble_flush_lock:
                             push_ok = await push_image_graffiti(cm, img)
                         if not push_ok:
-                            if not await ble_reconnect(cm):
+                            if not await ble_reconnect(cm, ble_watchdog):
                                 print("[now-playing] BLE lost during fallback carousel, exiting for systemd restart", file=sys.stderr)
                                 return 1
                             async with ble_flush_lock:
                                 retry_ok = await push_image_graffiti(cm, img)
                             if not retry_ok:
                                 print("[now-playing] Retry push also failed after reconnect (fallback carousel)", file=sys.stderr)
+                        else:
+                            ble_watchdog['last_activity'] = time.monotonic()
                         print(f"[now-playing] Fallback carousel: {cover_name} ({carousel_idx % len(carousel) + 1}/{len(carousel)})", file=sys.stderr)
                         carousel_current_name = cover_name
                         carousel_idx += 1
@@ -530,13 +588,15 @@ async def main_async():
                         async with ble_flush_lock:
                             push_ok = await push_image_graffiti(cm, img)
                         if not push_ok:
-                            if not await ble_reconnect(cm):
+                            if not await ble_reconnect(cm, ble_watchdog):
                                 print("[now-playing] BLE lost during clock update, exiting for systemd restart", file=sys.stderr)
                                 return 1
                             async with ble_flush_lock:
                                 retry_ok = await push_image_graffiti(cm, img)
                             if not retry_ok:
                                 print("[now-playing] Retry push also failed after reconnect (clock update)", file=sys.stderr)
+                        else:
+                            ble_watchdog['last_activity'] = time.monotonic()
                         print(f"[now-playing] Clock updated: {now.strftime('%H:%M')}", file=sys.stderr)
                         last_minute_key = minute_key
                     await asyncio.sleep(POLL_INTERVAL)
@@ -556,13 +616,15 @@ async def main_async():
                         async with ble_flush_lock:
                             push_ok = await push_image_graffiti(cm, img)
                         if not push_ok:
-                            if not await ble_reconnect(cm):
+                            if not await ble_reconnect(cm, ble_watchdog):
                                 print("[now-playing] BLE lost during carousel, exiting for systemd restart", file=sys.stderr)
                                 return 1
                             async with ble_flush_lock:
                                 retry_ok = await push_image_graffiti(cm, img)
                             if not retry_ok:
                                 print("[now-playing] Retry push also failed after reconnect (carousel)", file=sys.stderr)
+                        else:
+                            ble_watchdog['last_activity'] = time.monotonic()
                         print(f"[now-playing] Carousel: {cover_name} ({carousel_idx % len(carousel) + 1}/{len(carousel)})", file=sys.stderr)
                         carousel_current_name = cover_name
                         carousel_idx += 1
@@ -600,13 +662,15 @@ async def main_async():
                 async with ble_flush_lock:
                     push_ok = await push_image_graffiti(cm, img)
                 if not push_ok:
-                    if not await ble_reconnect(cm):
+                    if not await ble_reconnect(cm, ble_watchdog):
                         print("[now-playing] BLE lost during art push, exiting for systemd restart", file=sys.stderr)
                         return 1
                     async with ble_flush_lock:
                         retry_ok = await push_image_graffiti(cm, img)
                     if not retry_ok:
                         print("[now-playing] Retry push also failed after reconnect (art push)", file=sys.stderr)
+                else:
+                    ble_watchdog['last_activity'] = time.monotonic()
 
                 if track_changed:
                     print(f"[now-playing] ▶ {artist} - {title}", file=sys.stderr)
