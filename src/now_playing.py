@@ -166,9 +166,13 @@ def get_now_playing():
         "format": "json",
         "limit": 1,
     }
-    r = requests.get(LASTFM_URL, params=params, headers=LASTFM_HEADERS, timeout=10)
-    r.raise_for_status()
-    tracks = r.json()["recenttracks"]["track"]
+    try:
+        r = requests.get(LASTFM_URL, params=params, headers=LASTFM_HEADERS, timeout=10)
+        r.raise_for_status()
+        tracks = r.json()["recenttracks"]["track"]
+    except (requests.RequestException, KeyError, ValueError) as e:
+        print(f"[now-playing] Last.fm API error: {e}", file=sys.stderr)
+        return None
     if not tracks:
         return None
 
@@ -188,12 +192,16 @@ def get_now_playing():
 
 
 def fetch_album_art(url):
-    """Download album art and return a PIL Image."""
+    """Download album art and return a PIL Image. Returns None on failure."""
     if not url:
-        raise ValueError("No image URL")
-    r = requests.get(url, headers=LASTFM_HEADERS, timeout=10)
-    r.raise_for_status()
-    return Image.open(io.BytesIO(r.content)).convert("RGB")
+        return None
+    try:
+        r = requests.get(url, headers=LASTFM_HEADERS, timeout=10)
+        r.raise_for_status()
+        return Image.open(io.BytesIO(r.content)).convert("RGB")
+    except (requests.HTTPError, requests.RequestException, ValueError, IOError) as e:
+        print(f"[now-playing] Album art fetch failed ({url}): {e}", file=sys.stderr)
+        return None
 
 
 def load_carousel_covers():
@@ -655,8 +663,18 @@ async def main_async():
                     continue
 
                 if track_changed or image_url != last_image_url or last_art_image is None:
-                    last_art_image = fetch_album_art(image_url)
-                    last_image_url = image_url
+                    fetched = fetch_album_art(image_url)
+                    if fetched is not None:
+                        last_art_image = fetched
+                        last_image_url = image_url
+                    else:
+                        # Art fetch failed (404, network, etc.) — fall back to clock display
+                        print(f"[now-playing] Art unavailable, using clock fallback for: {track_id}", file=sys.stderr)
+                        last_track = track_id
+                        last_image_url = image_url
+                        last_art_image = None
+                        last_minute_key = minute_key
+                        continue
 
                 img = prepare_album_art(image_url, base_img=last_art_image, now=now)
                 async with ble_flush_lock:
